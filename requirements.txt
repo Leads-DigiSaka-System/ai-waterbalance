@@ -1,0 +1,10 @@
+numpy
+pandas
+xarray
+scipy
+rasterio
+pyproj
+shapely
+geopandas
+earthengine-api
+# tests: pytest

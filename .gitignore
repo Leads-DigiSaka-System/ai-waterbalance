@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Secrets
+.env
+
+# Generated locally: outputs, harmonized tiles, soil state, configs with local paths
+outputs/
+work/
+config.json
+config.local.json
