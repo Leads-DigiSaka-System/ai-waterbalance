@@ -1,0 +1,17 @@
+{
+  "aoi_path": "/data/vector/boundary_municipal_philippines.gpkg",
+  "aoi_name_col": "Mun_Name",
+  "aoi_names": ["SCIENCE CITY OF MUÑOZ"],
+  "ee_project": "your-gee-project",
+  "crs": "EPSG:4326",
+  "resolution_m": 100,
+  "tile_px": 128,
+  "tile_workers": 2,
+  "crop": "rice",
+  "irrigation": "none",
+  "cadence": "14d",
+  "period_anchor": "2026-01-01",
+  "spinup_days": 365,
+  "work_dir": "/data/waterbalance/work",
+  "output_dir": "/data/waterbalance/outputs"
+}
