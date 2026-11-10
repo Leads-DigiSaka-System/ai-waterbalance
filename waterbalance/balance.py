@@ -55,11 +55,14 @@ def classify(f, p, severe_f=0.25, valid=None):
     return cls
 
 
-def run_bucket(P, ET0, FC, WP, SAT, CN, S0, kc, p, tau=0.5, irrigation="none", periods=()):
+def run_bucket(P, ET0, FC, WP, SAT, CN, S0, kc, p, tau=0.5, irrigation="none", periods=(),
+               trace=False):
     """
     P, ET0     (t, h, w) mm/day
     FC, WP, SAT, CN, S0  (h, w)
     periods    [(label, i0, i1)]: day indices [i0, i1) to summarise
+    trace      also return the daily series (for small areas / plots): the result dict then has
+               '_daily' = {'f', 'S', 'R', 'ET', 'D', 'I'} each (t, h, w) float32
     -> (S_end (h, w), {label: dict of (h, w) arrays})
     """
     if irrigation not in ("none", "auto"):
@@ -79,6 +82,10 @@ def run_bucket(P, ET0, FC, WP, SAT, CN, S0, kc, p, tau=0.5, irrigation="none", p
         acc[label] = {"i0": i0, "i1": i1, "P": z.copy(), "I": z.copy(), "R": z.copy(),
                       "ET": z.copy(), "D": z.copy(), "stress_days": z.copy(),
                       "f_min": np.full_like(fc, np.inf), "S_start": None}
+
+    daily = None
+    if trace:
+        daily = {k: np.full(P.shape, np.nan, np.float32) for k in ("f", "S", "R", "ET", "D", "I")}
 
     for t in range(nt):
         for a in acc.values():
@@ -108,6 +115,9 @@ def run_bucket(P, ET0, FC, WP, SAT, CN, S0, kc, p, tau=0.5, irrigation="none", p
         s = s - et
 
         f = availability(s, fc, wp)
+        if daily is not None:
+            for k, v in (("f", f), ("S", s), ("R", r), ("ET", et), ("D", d), ("I", irr)):
+                daily[k][t] = v
         for a in acc.values():
             if a["i0"] <= t < a["i1"]:
                 a["P"] += pt
@@ -131,4 +141,6 @@ def run_bucket(P, ET0, FC, WP, SAT, CN, S0, kc, p, tau=0.5, irrigation="none", p
         res["residual"] = (a["P"] + a["I"] - a["R"] - a["ET"] - a["D"]
                            - (a["S_end"] - a["S_start"])).astype(np.float32)
         out[label] = res
+    if daily is not None:
+        out["_daily"] = daily
     return s.astype(np.float32), out

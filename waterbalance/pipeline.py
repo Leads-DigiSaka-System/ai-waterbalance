@@ -9,7 +9,12 @@ tile, so the next 14-day run starts from it and needs only that period's data. W
 state (first run, or settings changed), the tile is spun up over `spinup_days` before the period,
 starting from field capacity.
 
-Outputs per period, under output_dir/<AOI>/<period>/:
+  Runner.run_areas(level, names, periods)   one map per area (province, municipality ...) and
+                                            a mosaic of them per period
+  Runner.quick_check(bbox, period)          small area, in memory, with the DAILY f series
+
+Outputs per period, under <output root>/<AOI>/<period>/ (output_dir, or drive_root for 'gdrive' /
+'both'; copied to gs://gcs_bucket/gcs_prefix/... for 'gcs' / 'both'):
   wa_<AOI>_<period>_status.tif    int16  status class (-1 no data, 1 severe, 2 moderate,
                                          3 adequate, 4 surplus)
   wa_<AOI>_<period>_balance.tif   float32 bands: f_end, f_min, stress_days, P, I, R, ET, D, dS,
@@ -43,16 +48,31 @@ BALANCE_BANDS = ["f_end", "f_min", "stress_days", "P", "I", "R", "ET", "D", "dS"
                  "TAW", "crop_frac", "residual"]
 
 
+def _safe_label(label):
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(label).upper())
+
+
 def _h(obj, n=10):
     return hashlib.md5(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:n]
 
 
+AREA_LEVELS = ("bbox", "national", "regional", "provincial", "municipal")
+
+
 class Runner:
-    def __init__(self, cfg: RunConfig, fetcher=None, log=print):
+    def __init__(self, cfg: RunConfig, fetcher=None, log=print, gcs_client=None, aoi=None):
+        """aoi: optional (geometry EPSG:4326, label) overriding cfg.bbox / cfg.aoi_path."""
         self.cfg = cfg
         self.log = log
         self._fetcher = fetcher
+        self.gcs_client = gcs_client
         self._aoi = None
+        self._gdf = None
+        if aoi is not None:
+            geom, label = aoi
+            self._aoi = (geom, _safe_label(label))
+        if cfg.output_target in ("gcs", "both") and not cfg.gcs_bucket:
+            raise ValueError("output_target 'gcs' / 'both' needs gcs_bucket")
 
     # ---------------------------------------------------------- inputs
     @property
@@ -88,8 +108,7 @@ class Runner:
             label = cfg.aoi_label or ("_".join(cfg.aoi_names) if cfg.aoi_names else "AOI")
         else:
             raise ValueError("set bbox or aoi_path")
-        label = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in label.upper())
-        self._aoi = (geom, label)
+        self._aoi = (geom, _safe_label(label))
         return self._aoi
 
     def grid(self):
@@ -159,7 +178,10 @@ class Runner:
             return None
         path = self._harmonized_path(tgrid, start, end_excl)
         if os.path.exists(path):
-            return store.load_dataset(path)
+            ds = store.load_dataset(path)
+            if ds is None or not ds["p_fallback"].values.any():
+                return ds
+            # provisional (ERA5 precipitation on some days): fetch again, CHIRPS may be out now
         ds = hz.harmonize_tile(self.fetcher, tgrid, start, end_excl, self.cfg, static=st,
                                log=self.log)
         if ds is not None:
@@ -269,7 +291,8 @@ class Runner:
         summaries = []
         for p in self.resolve_periods(periods, as_of):
             self.log(f"period {p.label} ({p.start.date()} .. {(p.end - pd.Timedelta(days=1)).date()})")
-            out_dir = os.path.join(self.cfg.output_dir, label, p.label)
+            out_root = self.cfg.output_root()
+            out_dir = os.path.join(out_root, label, p.label)
             stem = os.path.join(out_dir, f"wa_{label}_{p.label}")
             tags = {"period_start": p.start.date(), "period_end_exclusive": p.end.date(),
                     "crop": self.cfg.crop, "kc": crop["kc"], "zr_m": crop["zr"], "p": crop["p"],
@@ -331,7 +354,181 @@ class Runner:
                 json.dump(info, fh, indent=2, default=str)
             if failed:
                 self.log(f"  {len(failed)} tile(s) failed — rerun to retry (finished tiles are cached)")
+            if self.cfg.output_target in ("gcs", "both"):
+                files = [stem + sfx for sfx in ("_status.tif", "_balance.tif", "_summary.csv",
+                                                "_stats.csv", "_run.json")]
+                info["uris"] = store.upload_files(self.gcs_client or _gcs_client(),
+                                                  self.cfg.gcs_bucket, self.cfg.gcs_prefix,
+                                                  out_root, files, log=self.log)
+                self.log(f"  uploaded to {info['uris'][0].rsplit('/', 1)[0]}/")
+                if self.cfg.output_target == "gcs":
+                    for f_ in files:
+                        os.remove(f_)
             self.log(f"  wrote {stem}_status.tif")
             info["summary"] = summary.to_dict("records")
             summaries.append(info)
         return summaries
+
+
+    # ---------------------------------------------------------- many areas
+    def boundaries(self):
+        """The boundary file (aoi_path) as a GeoDataFrame in EPSG:4326 (read once)."""
+        if self._gdf is None:
+            import geopandas as gpd
+            if not self.cfg.aoi_path:
+                raise ValueError("set aoi_path (boundary file)")
+            self._gdf = gpd.read_file(self.cfg.aoi_path).to_crs("EPSG:4326")
+        return self._gdf
+
+    def list_areas(self, column=None):
+        """Sorted names in `column` (default aoi_name_col) of the boundary file."""
+        col = column or self.cfg.aoi_name_col
+        return sorted(self.boundaries()[col].astype(str).str.strip().unique())
+
+    def select_areas(self, level, names=None):
+        """[(name, geometry)] for a run:
+           'national'   every feature of aoi_path (one map per aoi_name_col value)
+           'regional'   features whose region_col is in names
+           'provincial' / 'municipal'   features whose aoi_name_col is in names
+        Names match ignoring case and surrounding spaces."""
+        if level not in AREA_LEVELS[1:]:
+            raise ValueError(f"level must be one of {AREA_LEVELS[1:]}")
+        gdf = self.boundaries()
+        col = self.cfg.aoi_name_col
+        if not col:
+            raise ValueError("set aoi_name_col")
+        key = gdf[col].astype(str).str.strip()
+        if level == "regional":
+            if not self.cfg.region_col:
+                raise ValueError("regional runs need region_col")
+            want = {str(n).strip().upper() for n in names or []}
+            reg = gdf[self.cfg.region_col].astype(str).str.strip().str.upper()
+            missing = want - set(reg)
+            if missing:
+                raise ValueError(f"not found in {self.cfg.region_col}: {sorted(missing)}")
+            gdf, key = gdf[reg.isin(want)], key[reg.isin(want)]
+        elif level in ("provincial", "municipal"):
+            want = {str(n).strip().upper() for n in names or []}
+            if not want:
+                raise ValueError(f"{level} runs need names")
+            up = key.str.upper()
+            missing = want - set(up)
+            if missing:
+                raise ValueError(f"not found in {col}: {sorted(missing)}")
+            gdf, key = gdf[up.isin(want)], key[up.isin(want)]
+        out = []
+        for name in sorted(key.unique()):
+            g = gdf[key == name].geometry
+            out.append((name, g.union_all() if hasattr(g, "union_all") else g.unary_union))
+        return out
+
+    def area_runner(self, name, geom):
+        """Runner for one area of the boundary file (shares the fetcher and GCS client)."""
+        import dataclasses
+        cfg = dataclasses.replace(self.cfg, bbox=None, aoi_label=name)
+        return Runner(cfg, fetcher=self._fetcher, log=self.log, gcs_client=self.gcs_client,
+                      aoi=(geom, name))
+
+    def run_areas(self, level, names=None, periods=None, as_of=None, only=None):
+        """One run per area (each with its own maps), then one mosaic per period when there
+        are several areas and mosaic_after is on. only: rerun just these area names.
+        -> {'success': [...], 'failed': [...], 'mosaics': [...]}"""
+        ps = self.resolve_periods(periods, as_of)
+        areas = self.select_areas(level, names)
+        if only:
+            keep = {str(n).strip().upper() for n in only}
+            areas = [(n, g) for n, g in areas if n.upper() in keep]
+        self.log(f"{level}: {len(areas)} area(s), period(s) {', '.join(p.label for p in ps)}")
+        if self._fetcher is None and areas:
+            self._fetcher = self.fetcher                     # one Earth Engine session for all
+        success, failed = [], []
+        for k, (name, geom) in enumerate(areas, 1):
+            self.log(f"[{k}/{len(areas)}] {name}")
+            try:
+                for s in self.area_runner(name, geom).run(ps):
+                    s.pop("config", None)
+                    success.append({"area": name, **s})
+            except Exception as e:                           # noqa: BLE001
+                self.log(f"  FAILED {name}: {e!r}")
+                failed.append({"area": name, "error": repr(e)})
+        mosaics = []
+        if self.cfg.mosaic_after and len(areas) > 1 and self.cfg.output_target != "gcs":
+            label = self.cfg.mosaic_label or ("PHILIPPINES" if level == "national"
+                                              else "_".join(names or ["MOSAIC"]))
+            mosaics = self.mosaic(label, [n for n, _ in areas], ps)
+        return {"success": success, "failed": failed, "mosaics": mosaics}
+
+    def mosaic(self, label, area_names, periods):
+        """Merge the areas' maps of each period into <root>/<label>/<period>/ (status + balance
+        COGs and a hectares-per-class CSV). Areas without a map yet are listed as missing."""
+        root = self.cfg.output_root()
+        label = _safe_label(label)
+        out = []
+        for p in self.resolve_periods(periods):
+            stems = [os.path.join(root, _safe_label(n), p.label, f"wa_{_safe_label(n)}_{p.label}")
+                     for n in area_names]
+            have = [s for s in stems if os.path.exists(s + "_status.tif")]
+            missing = [n for n, s in zip(area_names, stems) if s not in have]
+            if not have:
+                out.append({"period": p.label, "error": "no area maps", "missing": missing})
+                continue
+            stem = os.path.join(root, label, p.label, f"wa_{label}_{p.label}")
+            store.mosaic_rasters([s + "_status.tif" for s in have], stem + "_status.tif")
+            store.mosaic_rasters([s + "_balance.tif" for s in have], stem + "_balance.tif")
+            summ = pd.concat([pd.read_csv(s + "_summary.csv") for s in have])
+            summ = summ.groupby(["status", "class"], as_index=False)[
+                ["pixels", "hectares", "cropland_hectares"]].sum()
+            tot = summ["hectares"].sum()
+            summ["share_pct"] = (100 * summ["hectares"] / tot).round(2) if tot else 0.0
+            summ.to_csv(stem + "_summary.csv", index=False)
+            m = {"period": p.label, "areas": len(have), "missing": missing,
+                 "status": stem + "_status.tif", "balance": stem + "_balance.tif",
+                 "summary": summ.to_dict("records")}
+            if self.cfg.output_target == "both":
+                m["uris"] = store.upload_files(self.gcs_client or _gcs_client(),
+                                               self.cfg.gcs_bucket, self.cfg.gcs_prefix, root,
+                                               [stem + "_status.tif", stem + "_balance.tif",
+                                                stem + "_summary.csv"], log=self.log)
+            self.log(f"  mosaic {p.label}: {len(have)} area(s) -> {stem}_status.tif")
+            out.append(m)
+        return out
+
+    # ---------------------------------------------------------- quick check
+    def quick_check(self, bbox, period=None, as_of=None, spinup_days=None):
+        """Small bbox, in memory (no cache, no files): harmonized inputs + the daily water
+        balance, spun up from field capacity. -> xarray Dataset with static layers, daily P, ET0,
+        f, S, R, ET, D, I (time, y, x), and the period's status class and f_end."""
+        import xarray as xr
+        from shapely.geometry import box
+        p = self.resolve_periods(period, as_of)[0]
+        g = lonlat_to_crs(box(*bbox), self.cfg.crs)
+        grid = Grid.for_bounds(g.bounds, res_in_crs(self.cfg.resolution_m, self.cfg.crs),
+                               self.cfg.crs)
+        if grid.width * grid.height > 512 * 512:
+            raise ValueError(f"quick_check is for small areas ({grid.width} x {grid.height} px)")
+        start = p.start - pd.Timedelta(days=spinup_days or self.cfg.spinup_days)
+        ds = hz.harmonize_tile(self.fetcher, grid, start, p.end, self.cfg, log=self.log)
+        if ds is None:
+            raise ValueError("no cropland in this bbox")
+        crop = self.cfg.crop_params()
+        i0 = (p.start - start).days
+        i1 = i0 + (p.end - p.start).days
+        _, res = bal.run_bucket(ds["P"].values, ds["ET0"].values, ds["FC"].values,
+                                ds["WP"].values, ds["SAT"].values, ds["CN"].values,
+                                ds["FC"].values, crop["kc"], crop["p"], self.cfg.drainage_tau,
+                                self.cfg.irrigation, periods=[(p.label, i0, i1)], trace=True)
+        valid = ds["crop_mask"].values == 1
+        for k, v in res["_daily"].items():
+            ds[k] = (("time", "y", "x"), np.where(valid, v, np.nan))
+        r = res[p.label]
+        ds["f_end"] = (("y", "x"), np.where(valid, r["f_end"], np.nan))
+        ds["status"] = (("y", "x"), bal.classify(r["f_end"], crop["p"], self.cfg.severe_f, valid))
+        ds.attrs.update({"period": p.label, "period_start": str(p.start.date()),
+                         "period_end": str((p.end - pd.Timedelta(days=1)).date()),
+                         "p": crop["p"], "severe_f": self.cfg.severe_f})
+        return ds
+
+
+def _gcs_client():
+    from google.cloud import storage
+    return storage.Client()

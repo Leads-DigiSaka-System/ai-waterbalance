@@ -73,6 +73,7 @@ class RunConfig:
     aoi_name_col: str | None = None           # column holding the area names
     aoi_names: list | None = None             # names to process (None = every feature)
     aoi_label: str | None = None              # name used in output files (default from names / "AOI")
+    region_col: str | None = None             # column used to pick areas by region (run_areas)
 
     # ---- grid (harmonized resolution)
     crs: str = "EPSG:4326"                    # EPSG:4326 = global grid (like ai-cropgrowth);
@@ -111,7 +112,13 @@ class RunConfig:
 
     # ---- storage
     work_dir: str = "work"                    # harmonized tiles, soil state, caches
-    output_dir: str = "outputs"
+    output_dir: str = "outputs"               # local outputs ('local'), staging folder for 'gcs'
+    output_target: str = "local"              # 'local' | 'gdrive' | 'gcs' | 'both' (Drive + GCS)
+    drive_root: str = "/content/drive/MyDrive/AI-WaterBalance/outputs"   # 'gdrive' / 'both'
+    gcs_bucket: str | None = None             # 'gcs' / 'both'
+    gcs_prefix: str = "products/water_availability"
+    mosaic_after: bool = True                 # run_areas with several areas: one mosaic per period
+    mosaic_label: str | None = None           # mosaic folder / file name (default PHILIPPINES or region)
 
     # ------------------------------------------------------------------
     def crop_params(self):
@@ -123,6 +130,12 @@ class RunConfig:
             if v is not None:
                 c[k] = float(v)
         return c
+
+    def output_root(self):
+        """Folder the outputs are written to (Drive for 'gdrive' / 'both')."""
+        if self.output_target not in ("local", "gdrive", "gcs", "both"):
+            raise ValueError("output_target must be 'local', 'gdrive', 'gcs' or 'both'")
+        return self.drive_root if self.output_target in ("gdrive", "both") else self.output_dir
 
     def model_hash(self):
         """Hash of everything that changes the soil-water state (for state-file keys)."""
