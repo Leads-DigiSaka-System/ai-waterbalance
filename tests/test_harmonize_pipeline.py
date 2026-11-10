@@ -137,3 +137,16 @@ def test_plan(tmp_path):
     r = Runner(_cfg(tmp_path), fetcher=FakeFetcher(), log=lambda *a: None)
     plan = r.plan(["20260910"])
     assert plan["periods"][0]["tiles"] == 9 and plan["periods"][0]["tiles_spinup"] == 9
+
+
+def test_provisional_tiles_are_fetched_again(tmp_path):
+    fake = FakeFetcher()
+    r = Runner(_cfg(tmp_path), fetcher=fake, log=lambda *a: None)
+    r.harmonize(["20261022"])                       # CHIRPS ends 2026-10-20 -> ERA5 fallback
+    n = len(fake.daily_calls)
+    r.harmonize(["20261022"])
+    assert len(fake.daily_calls) == 2 * n           # not served from the cache
+    r.harmonize(["20260910"])                       # complete CHIRPS -> cached
+    m = len(fake.daily_calls)
+    r.harmonize(["20260910"])
+    assert len(fake.daily_calls) == m

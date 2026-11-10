@@ -105,3 +105,65 @@ class RasterWriter:
         except Exception:                               # noqa: BLE001 - GDAL without COG driver
             os.replace(self.tmp, self.path)
         return self.path
+
+
+# ------------------------------------------------------------------ Cloud Storage
+def upload_files(client, bucket, prefix, root, paths, log=print):
+    """Upload local files (under root) to gs://bucket/prefix/<path relative to root>. -> URIs."""
+    b = client.bucket(bucket)
+    uris = []
+    for p in paths:
+        rel = os.path.relpath(p, root).replace(os.sep, "/")
+        name = f"{prefix.strip('/')}/{rel}" if prefix else rel
+        blob = b.blob(name)
+        for attempt in range(4):
+            try:
+                blob.upload_from_filename(p)
+                break
+            except Exception as e:                     # noqa: BLE001
+                if attempt == 3:
+                    raise
+                log(f"    upload retry {attempt + 1}/3 ({e.__class__.__name__})")
+                import time
+                time.sleep(2 ** attempt)
+        uris.append(f"gs://{bucket}/{name}")
+    return uris
+
+
+# ------------------------------------------------------------------ mosaic
+def mosaic_rasters(paths, out_path, block_rows=1024):
+    """Merge rasters on the same aligned grid (e.g. every province's map of one period) into one
+    COG covering all of them. Read block by block, so memory stays small. Where inputs overlap
+    (shared borders), the first valid value wins."""
+    import rasterio
+    from rasterio.windows import Window
+
+    from .grid import Grid
+    if not paths:
+        raise ValueError("nothing to mosaic")
+    with rasterio.open(paths[0]) as r0:
+        res, crs, count = r0.res[0], r0.crs.to_string(), r0.count
+        dtype, nodata, names = r0.dtypes[0], r0.nodata, list(r0.descriptions)
+        tags = r0.tags()
+    bounds = []
+    for p in paths:
+        with rasterio.open(p) as r:
+            bounds.append(r.bounds)
+    union = (min(b.left for b in bounds), min(b.bottom for b in bounds),
+             max(b.right for b in bounds), max(b.top for b in bounds))
+    grid = Grid.for_bounds(union, res, crs)
+    w = RasterWriter(out_path, grid, names, dtype, nodata, tags)
+    is_nan = nodata is None or (isinstance(nodata, float) and np.isnan(nodata))
+    for p in paths:
+        with rasterio.open(p) as r:
+            sub = Grid.for_bounds(tuple(r.bounds), res, crs)
+            col, row = sub.offset_in(grid)
+            for r0_ in range(0, r.height, block_rows):
+                h = min(block_rows, r.height - r0_)
+                src = r.read(window=Window(0, r0_, r.width, h))
+                win = Window(col, row + r0_, r.width, h)
+                with w._lock:
+                    cur = w._ds.read(window=win)
+                    empty = np.isnan(cur) if is_nan else (cur == nodata)
+                    w._ds.write(np.where(empty, src, cur).astype(w.dtype), window=win)
+    return w.close()

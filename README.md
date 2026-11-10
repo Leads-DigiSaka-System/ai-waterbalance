@@ -94,6 +94,20 @@ With no `--periods`, the run makes the last period that has fully ended by today
 
 ## Run it
 
+**Colab:** open `notebooks/run_water_availability.ipynb`, the full pipeline notebook (the
+ai-cropgrowth layout without the agent). It covers:
+
+1. clone and install, Drive, Earth Engine and Cloud Storage sign-in
+2. settings
+3. a **quick check** on a small bbox, with maps of cropland share, TAW, f and status, and the daily
+   P / ETc / f of a few pixels
+4. the plan
+5. the periodic run per area (national / regional / provincial / municipal / bbox), with results,
+   hectares per class and the mosaic
+6. the maps read back from the GeoTIFFs
+
+**Command line:**
+
 ```bash
 pip install -r requirements.txt
 earthengine authenticate            # once
@@ -112,6 +126,12 @@ python -m waterbalance run       --bbox 120.85 15.55 121.05 15.75 --crop rice --
 
 ```python
 from waterbalance import RunConfig, Runner
+# one map per province of a region + one mosaic per period, saved to Drive
+r = Runner(RunConfig(aoi_path="boundary_province.gpkg", aoi_name_col="Pro_Name", region_col="Reg_Name",
+                     crop="rice", ee_project="my-project", output_target="gdrive"))
+r.run_areas("regional", ["REGION III"], ["20261022"])
+r.quick_check((120.90, 15.60, 120.95, 15.65), "20261022")      # daily f series, in memory
+
 r = Runner(RunConfig(aoi_path="boundary_municipal.gpkg", aoi_name_col="Mun_Name",
                      aoi_names=["SCIENCE CITY OF MUÑOZ"], crop="rice", ee_project="my-project"))
 r.run(["20261022"])
@@ -133,6 +153,8 @@ r.run(["20261022"])
 | `spinup_days` | 365 | Spin-up when no saved state exists |
 | `precip_fallback` | `era5` | Use ERA5-Land P on days CHIRPS lacks (`none`: fail instead) |
 | `tile_workers` | 2 | Tiles processed in parallel |
+| `output_target` | `local` | `local` (`output_dir`), `gdrive` (`drive_root`), `gcs` (`gcs_bucket`/`gcs_prefix`), `both` |
+| `region_col`, `mosaic_after`, `mosaic_label` | —, true, — | `run_areas`: pick areas by region; one mosaic per period |
 
 Dataset ids and band names are in `config.DATASETS`.
 
@@ -163,6 +185,7 @@ native units. They cover:
 - `irrigation='auto'` is a scenario (what full irrigation would add), not observed irrigation.
   Irrigated-area masks, measured volumes and SMAP detection are planned.
 - CHIRPS final lags by several weeks, so recent periods use ERA5-Land precipitation and are
-  flagged `provisional`. Rerun them once CHIRPS is published.
+  flagged `provisional`. Once CHIRPS is published, rerun that period and every later one, in order.
+  Provisional tiles are always fetched again, never served from the cache.
 - The Earth Engine calls have been checked against the API documentation but not yet run live
   from this repository. Run `plan`, then one small bbox first.
