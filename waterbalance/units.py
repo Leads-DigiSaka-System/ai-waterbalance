@@ -44,6 +44,11 @@ def wind_to_2m(uz, z=10.0):
     return np.asarray(uz, dtype=np.float32) * 4.87 / np.log(67.8 * z - 5.42)
 
 
+def mm_per_hr_to_mm_per_day(rate):
+    """Mean precipitation rate over a day (mm/hr, e.g. GPM IMERG) -> daily total (mm/day)."""
+    return np.asarray(rate, dtype=np.float32) * 24.0
+
+
 def percent_to_fraction(x_pct):
     return np.asarray(x_pct, dtype=np.float32) / 100.0
 

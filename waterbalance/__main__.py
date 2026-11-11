@@ -23,6 +23,7 @@ FLAGS = {
     "--spinup-days": ("spinup_days", int), "--crop": ("crop", str),
     "--irrigation": ("irrigation", str), "--work-dir": ("work_dir", str),
     "--output-dir": ("output_dir", str), "--precip-fallback": ("precip_fallback", str),
+    "--precip-source": ("precip_source", str),
 }
 
 

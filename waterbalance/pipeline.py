@@ -48,6 +48,12 @@ BALANCE_BANDS = ["f_end", "f_min", "stress_days", "P", "I", "R", "ET", "D", "dS"
                  "TAW", "crop_frac", "residual"]
 
 
+def _is_provisional(ds):
+    """Harmonized tile with precipitation that will still change (ERA5 fallback days, or GPM
+    Late-run / incomplete days)."""
+    return any(v in ds and bool(ds[v].values.any()) for v in ("p_fallback", "p_provisional"))
+
+
 def _safe_label(label):
     return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(label).upper())
 
@@ -146,7 +152,8 @@ class Runner:
 
     def _harmonized_path(self, tgrid, start, end_excl):
         c = self.cfg
-        k = _h({"chirps": DATASETS["chirps"], "era5": DATASETS["era5"], "pf": c.precip_fallback})
+        k = _h({"precip": c.precip_source, "p_ds": DATASETS[c.precip_source],
+                "era5": DATASETS["era5"], "pf": c.precip_fallback})
         return os.path.join(c.work_dir, "harmonized", k,
                             f"{self._tile_key(tgrid)}_{start:%Y%m%d}_{end_excl:%Y%m%d}.npz")
 
@@ -179,9 +186,10 @@ class Runner:
         path = self._harmonized_path(tgrid, start, end_excl)
         if os.path.exists(path):
             ds = store.load_dataset(path)
-            if ds is None or not ds["p_fallback"].values.any():
+            if ds is None or not _is_provisional(ds):
                 return ds
-            # provisional (ERA5 precipitation on some days): fetch again, CHIRPS may be out now
+            # provisional (ERA5 precipitation, or GPM Late run, on some days): fetch again,
+            # the final precipitation may be out now
         ds = hz.harmonize_tile(self.fetcher, tgrid, start, end_excl, self.cfg, static=st,
                                log=self.log)
         if ds is not None:
@@ -251,8 +259,10 @@ class Runner:
         status = bal.classify(r["f_end"], crop["p"], self.cfg.severe_f, valid)
         bands = {b: np.where(valid, r[b], np.nan).astype(np.float32) for b in BALANCE_BANDS}
         fb = ds["p_fallback"].values[i0:i1]
+        pv = ds["p_provisional"].values[i0:i1] if "p_provisional" in ds else np.zeros(0)
         return {"status": status, "bands": bands, "valid": valid,
-                "p_fallback_days": int(fb.sum()), "spinup": start < period.start}
+                "p_fallback_days": int(fb.sum()), "p_provisional_days": int(pv.sum()),
+                "spinup": start < period.start}
 
     def _for_tiles(self, tiles, fn):
         """Run fn(tile_grid) over tiles in parallel -> {tile_id: (result, error)}."""
@@ -304,7 +314,7 @@ class Runner:
             area_ha = {s: 0.0 for s in bal.STATUS if s != -1}
             pix = {s: 0 for s in bal.STATUS if s != -1}
             crop_ha = {s: 0.0 for s in bal.STATUS if s != -1}
-            sums, wsum, fb_days, n_spin = {b: 0.0 for b in BALANCE_BANDS}, 0.0, 0, 0
+            sums, wsum, fb_days, pv_days, n_spin = {b: 0.0 for b in BALANCE_BANDS}, 0.0, 0, 0, 0
             tile_grids = dict(tiles)
 
             results = self._for_tiles(tiles, lambda tg: self._tile_period(tg, p, geom_crs))
@@ -327,6 +337,7 @@ class Runner:
                     sums[b] += float(np.nansum(np.nan_to_num(r["bands"][b]) * wts))
                 wsum += float(wts.sum())
                 fb_days = max(fb_days, r["p_fallback_days"])
+                pv_days = max(pv_days, r["p_provisional_days"])
                 n_spin += int(r["spinup"])
             w_status.close()
             w_bal.close()
@@ -346,7 +357,10 @@ class Runner:
                     "tiles": len(tiles),
                     "tiles_with_cropland": sum(r is not None for r, _ in results.values()),
                     "tiles_spun_up": n_spin, "failed_tiles": failed,
-                    "precip_from_era5_days": fb_days, "provisional": bool(fb_days or failed),
+                    "precip_source": self.cfg.precip_source,
+                    "precip_from_era5_days": fb_days,
+                    "precip_provisional_days": pv_days,
+                    "provisional": bool(fb_days or pv_days or failed),
                     "outputs": {"status": stem + "_status.tif", "balance": stem + "_balance.tif",
                                 "summary": stem + "_summary.csv", "stats": stem + "_stats.csv"},
                     "config": {k: v for k, v in vars(self.cfg).items()}}

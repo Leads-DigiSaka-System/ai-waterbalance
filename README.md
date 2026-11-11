@@ -31,8 +31,10 @@ Stage 1 — harmonize (harmonize.py), per tile, cached under work_dir/
   │                                                 texture -> hydrologic group -> curve number
   ├─ ERA5-Land daily 0.1° ── bilinear ──> K -> °C, Pa -> kPa, J m-2 -> MJ m-2, u10/v10 -> u2,
   │                                       m -> mm  =>  FAO-56 Penman-Monteith ET0 (mm/day)
-  └─ CHIRPS daily 0.05° ── bilinear ──> P (mm/day); days not yet in CHIRPS use ERA5-Land
-                                         precipitation and are flagged provisional
+  └─ GPM IMERG V07 half-hourly 0.1° ── daily mean per UTC day (server) ── bilinear
+                                      ──> mm/hr x 24 -> P (mm/day); Late-run days flagged
+                                      provisional; days with no data yet use ERA5-Land P
+                                      (precip_source='chirps': CHIRPS daily 0.05°, mm/day)
 
 Stage 2 — water balance (balance.py), per pixel per day
   irrigation (optional) -> SCS-CN runoff -> infiltration (excess over saturation runs off)
@@ -151,7 +153,8 @@ r.run(["20261022"])
 | `cn_by_hsg` | 67/78/85/89 | Curve numbers for groups A–D (calibrate for bunded paddies) |
 | `drainage_tau` | 0.5 | Share of the water above FC drained per day |
 | `spinup_days` | 365 | Spin-up when no saved state exists |
-| `precip_fallback` | `era5` | Use ERA5-Land P on days CHIRPS lacks (`none`: fail instead) |
+| `precip_source` | `gpm` | `gpm` (IMERG V07, ~1 day behind) or `chirps` (CHIRPS daily, weeks behind) |
+| `precip_fallback` | `era5` | Use ERA5-Land P on days the source lacks (`none`: fail instead) |
 | `tile_workers` | 2 | Tiles processed in parallel |
 | `output_target` | `local` | `local` (`output_dir`), `gdrive` (`drive_root`), `gcs` (`gcs_bucket`/`gcs_prefix`), `both` |
 | `region_col`, `mosaic_after`, `mosaic_label` | —, true, — | `run_areas`: pick areas by region; one mosaic per period |
@@ -184,8 +187,14 @@ native units. They cover:
 - Flooded paddies need ponded-water storage, and percolation in place of the drainage term.
 - `irrigation='auto'` is a scenario (what full irrigation would add), not observed irrigation.
   Irrigated-area masks, measured volumes and SMAP detection are planned.
-- CHIRPS final lags by several weeks, so recent periods use ERA5-Land precipitation and are
-  flagged `provisional`. Once CHIRPS is published, rerun that period and every later one, in order.
-  Provisional tiles are always fetched again, never served from the cache.
+- GPM IMERG arrives within about a day, but recent days come from its Late run (Earth Engine
+  property `status = 'provisional'`). They are counted in `precip_provisional_days`, and the period
+  is flagged `provisional`. The Final run replaces them a few months later. Rerun those periods
+  then, and every later one, in order. Provisional tiles are always fetched again, never served
+  from the cache.
+- GPM days are UTC days (08:00–08:00 Philippine time). This doesn't matter for 14-day totals.
+- The GPM `status` property and the 48 half-hourly images per day are assumptions from the
+  catalog; check them on the first live run. If the property is absent, nothing is flagged as Late
+  run, and only incomplete days are flagged.
 - The Earth Engine calls have been checked against the API documentation but not yet run live
   from this repository. Run `plan`, then one small bbox first.

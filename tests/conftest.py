@@ -3,7 +3,11 @@ tests exercise the unit harmonization and run offline (no earthengine-api login,
 
 Cropland: the west half of any tile (crop_frac 0.8), none in the east half. Soil: loam
 (sand 40 %, clay 20 %, OM ~2.5 %). Weather: warm and humid; rain 12 mm every 4th day before
-RAIN_UNTIL, dry afterwards. CHIRPS stops at CHIRPS_UNTIL (later days must come from ERA5)."""
+RAIN_UNTIL, dry afterwards.
+  GPM    half-hourly mean rate in mm/hr (rain / 24) up to GPM_UNTIL; days after GPM_FINAL_UNTIL
+         are Late run (flagged provisional)
+  CHIRPS mm/day up to CHIRPS_UNTIL
+Later days must come from ERA5-Land."""
 import numpy as np
 import pandas as pd
 import pytest
@@ -11,7 +15,9 @@ import pytest
 from waterbalance.config import DATASETS
 
 RAIN_UNTIL = pd.Timestamp("2026-08-01")
-CHIRPS_UNTIL = pd.Timestamp("2026-10-20")      # last CHIRPS day (exclusive end + 1)
+CHIRPS_UNTIL = pd.Timestamp("2026-10-20")      # last CHIRPS day
+GPM_FINAL_UNTIL = pd.Timestamp("2026-10-01")   # last GPM Final-run day; later = Late run
+GPM_UNTIL = pd.Timestamp("2026-11-09")         # last GPM day (about a day of latency)
 ERA5_UNTIL = pd.Timestamp("2026-12-31")
 
 
@@ -35,7 +41,7 @@ class FakeFetcher:
 
     def daily(self, source, start, end_excl, grid):
         self.daily_calls.append((source, pd.Timestamp(start), pd.Timestamp(end_excl)))
-        until = CHIRPS_UNTIL if source == "chirps" else ERA5_UNTIL
+        until = {"chirps": CHIRPS_UNTIL, "gpm": GPM_UNTIL}.get(source, ERA5_UNTIL)
         days = pd.date_range(start, pd.Timestamp(end_excl) - pd.Timedelta(days=1), freq="D")
         days = days[days <= until]
         shape = (len(days), grid.height, grid.width)
@@ -43,6 +49,9 @@ class FakeFetcher:
                          for d in days], np.float32)[:, None, None]
         if source == "chirps":
             return days, {"precip": np.broadcast_to(rain, shape).astype(np.float32).copy()}
+        if source == "gpm":
+            return days, {"precip": np.broadcast_to(rain / 24.0, shape).astype(np.float32).copy(),
+                          "_provisional": np.asarray(days > GPM_FINAL_UNTIL)}
         full = lambda v: np.full(shape, v, np.float32)          # noqa: E731
         return days, {
             "tmin": full(296.0), "tmax": full(305.0), "tdew": full(294.0),
