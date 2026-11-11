@@ -152,7 +152,8 @@ class Runner:
 
     def _harmonized_path(self, tgrid, start, end_excl):
         c = self.cfg
-        k = _h({"precip": c.precip_source, "p_ds": DATASETS[c.precip_source],
+        k = _h({"v": hz.HARMONIZE_VERSION, "precip": c.precip_source,
+                "p_ds": DATASETS[c.precip_source],
                 "era5": DATASETS["era5"], "pf": c.precip_fallback})
         return os.path.join(c.work_dir, "harmonized", k,
                             f"{self._tile_key(tgrid)}_{start:%Y%m%d}_{end_excl:%Y%m%d}.npz")
@@ -275,6 +276,8 @@ class Runner:
                     return fn(tg), None
                 except hz.DataNotReady as e:
                     return None, f"DataNotReady: {e}"
+                except hz.BadData as e:                    # retrying would give the same
+                    return None, f"BadData: {e}"
                 except Exception as e:                     # noqa: BLE001
                     last = e
                     self.log(f"  tile error ({e.__class__.__name__}: {e}) — retry {attempt + 1}/2")

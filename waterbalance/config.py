@@ -157,7 +157,8 @@ class RunConfig:
 
     def model_hash(self):
         """Hash of everything that changes the soil-water state (for state-file keys)."""
-        parts = dict(crop=self.crop_params(), cn=self.cn_by_hsg, tau=self.drainage_tau,
+        from .harmonize import HARMONIZE_VERSION
+        parts = dict(v=HARMONIZE_VERSION, crop=self.crop_params(), cn=self.cn_by_hsg, tau=self.drainage_tau,
                      irr=self.irrigation, crs=self.crs, res=self.resolution_m,
                      tile=self.tile_px, cmin=self.crop_fraction_min, pf=self.precip_fallback,
                      ps=self.precip_source,

@@ -178,3 +178,23 @@ def test_provisional_tiles_are_fetched_again(tmp_path):
     m = len(fake.daily_calls)
     r.harmonize(["20260910"])
     assert len(fake.daily_calls) == m
+
+
+def test_missing_weather_variable_fails_loudly(tmp_path):
+    # a weather variable without values must stop the run, not turn into zero ET
+    cfg, g, f = _cfg(tmp_path), _grid(), FakeFetcher()
+    a, b = pd.Timestamp("2026-07-01"), pd.Timestamp("2026-07-15")
+    dates, era5 = f.daily("era5", a, b, g)
+    era5["rnl"][:] = np.nan
+    with pytest.raises(hz.BadData, match="rns"):
+        hz.harmonize_daily(f.daily("gpm", a, b, g), (dates, era5), a, b, cfg)
+
+
+def test_dry_season_lowers_f_with_realistic_et(tmp_path):
+    # no rain after August: crop ET must draw the soil down well below field capacity
+    r = Runner(_cfg(tmp_path, crop="rice"), fetcher=FakeFetcher(), log=lambda *a: None)
+    ds = r.quick_check((120.90, 15.60, 120.91, 15.61), "20261008", spinup_days=150)
+    crop = ds["crop_mask"].values == 1
+    et = np.nanmean(ds["ET"].values[:, crop], axis=1)
+    assert et[:60].mean() > 2.0                                     # mm/day while wet
+    assert float(np.nanmax(ds["f_end"].values)) < 0.5
