@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 import rasterio
 
-from conftest import CHIRPS_UNTIL, FakeFetcher
+from conftest import CHIRPS_UNTIL, GPM_FINAL_UNTIL, GPM_UNTIL, FakeFetcher
 from waterbalance import harmonize as hz
 from waterbalance.config import RunConfig
 from waterbalance.grid import Grid, res_in_crs
@@ -38,29 +38,55 @@ def test_static_harmonization_units_and_mask(tmp_path):
     assert (st["CN"] == 78).all()                                   # loam -> group B
 
 
-def test_daily_harmonization_units_and_fallback(tmp_path):
-    cfg, g, f = _cfg(tmp_path), _grid(), FakeFetcher()
-    a, b = pd.Timestamp("2026-10-10"), pd.Timestamp("2026-10-30")
-    days, p, et0, fb, _ = hz.harmonize_daily(f.daily("chirps", a, b, g), f.daily("era5", a, b, g),
-                                             a, b, cfg)
-    assert len(days) == 20 and p.shape[0] == 20
+def _daily(cfg, a, b, f=None):
+    f, g = f or FakeFetcher(), _grid()
+    return hz.harmonize_daily(f.daily(cfg.precip_source, a, b, g), f.daily("era5", a, b, g),
+                              a, b, cfg)
+
+
+def test_gpm_units_mm_per_hour_to_mm_per_day(tmp_path):
+    cfg = _cfg(tmp_path)                                            # precip_source='gpm'
+    a, b = pd.Timestamp("2026-07-01"), pd.Timestamp("2026-07-15")
+    days, p, et0, flags, _ = _daily(cfg, a, b)
+    rainy = np.array([d.day_of_year % 4 == 0 for d in days])
+    assert np.allclose(p[rainy], 12.0) and np.allclose(p[~rainy], 0.0)   # 0.5 mm/hr x 24
     assert 3.0 < float(et0.mean()) < 7.0                            # warm humid tropics, mm/day
-    late = days > CHIRPS_UNTIL
-    assert fb[late].all() and not fb[~late].any()                   # ERA5 fills missing CHIRPS
+    assert not flags["p_provisional"].any() and not flags["p_fallback"].any()
+
+
+def test_gpm_late_run_days_are_provisional(tmp_path):
+    cfg = _cfg(tmp_path)
+    a, b = pd.Timestamp("2026-09-25"), pd.Timestamp("2026-10-10")
+    days, _, _, flags, _ = _daily(cfg, a, b)
+    late = days > GPM_FINAL_UNTIL
+    assert flags["p_provisional"][late].all() and not flags["p_provisional"][~late].any()
+
+
+def test_era5_fills_days_the_precip_source_lacks(tmp_path):
+    for src, until in (("gpm", GPM_UNTIL), ("chirps", CHIRPS_UNTIL)):
+        cfg = _cfg(tmp_path, precip_source=src)
+        a, b = until - pd.Timedelta(days=5), until + pd.Timedelta(days=5)
+        days, p, _, flags, _ = _daily(cfg, a, b)
+        late = days > until
+        assert flags["p_fallback"][late].all() and not flags["p_fallback"][~late].any()
+        assert not flags["p_provisional"][late].any()               # counted as fallback instead
 
 
 def test_era5_latency_raises(tmp_path):
-    cfg, g, f = _cfg(tmp_path), _grid(), FakeFetcher()
-    a, b = pd.Timestamp("2026-12-20"), pd.Timestamp("2027-01-05")
+    cfg = _cfg(tmp_path)
     with pytest.raises(hz.DataNotReady):
-        hz.harmonize_daily(f.daily("chirps", a, b, g), f.daily("era5", a, b, g), a, b, cfg)
+        _daily(cfg, pd.Timestamp("2026-12-20"), pd.Timestamp("2027-01-05"))
 
 
-def test_chirps_missing_without_fallback_raises(tmp_path):
-    cfg, g, f = _cfg(tmp_path, precip_fallback="none"), _grid(), FakeFetcher()
-    a, b = pd.Timestamp("2026-10-10"), pd.Timestamp("2026-10-30")
+def test_missing_precip_without_fallback_raises(tmp_path):
+    cfg = _cfg(tmp_path, precip_source="chirps", precip_fallback="none")
     with pytest.raises(hz.DataNotReady):
-        hz.harmonize_daily(f.daily("chirps", a, b, g), f.daily("era5", a, b, g), a, b, cfg)
+        _daily(cfg, pd.Timestamp("2026-10-10"), pd.Timestamp("2026-10-30"))
+
+
+def test_bad_precip_source():
+    with pytest.raises(ValueError):
+        RunConfig(precip_source="imerg")
 
 
 def test_fill_nearest():
@@ -107,9 +133,11 @@ def test_run_writes_maps_and_chains_soil_state(tmp_path):
     f1 = pd.read_csv(s1["outputs"]["stats"]).set_index("variable")["crop_area_weighted_mean"]
     assert f2["f_end"] < f1["f_end"]
 
-    # a period with CHIRPS missing is flagged provisional
+    # a period with GPM Late-run days is flagged provisional
     s3 = r.run(["20261022"])[0]
-    assert s3["precip_from_era5_days"] > 0 and s3["provisional"]
+    assert s3["precip_source"] == "gpm"
+    assert s3["precip_provisional_days"] == 14 and s3["precip_from_era5_days"] == 0
+    assert s3["provisional"]
     with open(s3["outputs"]["summary"].replace("_summary.csv", "_run.json")) as fh:
         assert json.load(fh)["provisional"] is True
 
@@ -142,11 +170,11 @@ def test_plan(tmp_path):
 def test_provisional_tiles_are_fetched_again(tmp_path):
     fake = FakeFetcher()
     r = Runner(_cfg(tmp_path), fetcher=fake, log=lambda *a: None)
-    r.harmonize(["20261022"])                       # CHIRPS ends 2026-10-20 -> ERA5 fallback
+    r.harmonize(["20261022"])                       # GPM Late run -> provisional
     n = len(fake.daily_calls)
     r.harmonize(["20261022"])
     assert len(fake.daily_calls) == 2 * n           # not served from the cache
-    r.harmonize(["20260910"])                       # complete CHIRPS -> cached
+    r.harmonize(["20260910"])                       # GPM Final run only -> cached
     m = len(fake.daily_calls)
     r.harmonize(["20260910"])
     assert len(fake.daily_calls) == m

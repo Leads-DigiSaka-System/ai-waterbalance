@@ -188,9 +188,13 @@ class EEFetcher:
 
     # ---------------------------------------------------------- daily stacks
     def daily(self, source, start, end_excl, grid):
-        """Daily stack of `source` ('chirps' or 'era5') on the grid for [start, end_excl), in the
-        dataset's native units. -> (DatetimeIndex, dict var -> (t, h, w) float32). Days missing
-        from the collection are absent from the index (harmonize.py reindexes them)."""
+        """Daily stack of `source` ('gpm', 'chirps' or 'era5') on the grid for [start, end_excl),
+        in the dataset's native units (GPM: the day's mean rate, mm/hr).
+        -> (DatetimeIndex, dict var -> (t, h, w) float32). Days missing from the collection are
+        absent from the index (harmonize.py reindexes them). GPM also returns '_provisional'
+        (t,) bool: days with Late-run images or fewer than 48 half-hourly images."""
+        if source == "gpm":
+            return self._gpm_daily(start, end_excl, grid)
         ee = self.ee
         ds = DATASETS[source]
         bands = ds["bands"]
@@ -229,11 +233,59 @@ class EEFetcher:
         parts = fetch_split(fetch, start, end_excl, days, self.cfg.request_retries, log=self.log)
         return merge_daily_parts(parts, dst, grid)
 
+    def _gpm_daily(self, start, end_excl, grid):
+        """GPM IMERG half-hourly -> one image per UTC day (mean rate, mm/hr), built on the server,
+        then read like any daily stack."""
+        ee = self.ee
+        ds = DATASETS["gpm"]
+        band = ds["bands"]["precip"]
+        proj = ee.ImageCollection(ds["id"]).first().select(band).projection()
+        days = days_per_request(1, grid.height, grid.width, self.cfg.max_request_mb,
+                                self.cfg.max_bands_per_request)
+
+        def fetch(a, b):
+            n = (b - a).days
+            col = ee.ImageCollection(ds["id"]).filterDate(a.strftime("%Y-%m-%d"),
+                                                          b.strftime("%Y-%m-%d")).select(band)
+            d0 = ee.Date(a.strftime("%Y-%m-%d"))
+
+            def day_image(i):
+                s = d0.advance(i, "day")
+                c = col.filterDate(s, s.advance(1, "day"))
+                img = (c.mean().rename("precip").setDefaultProjection(proj)
+                       .resample("bilinear").toFloat().unmask(NODATA, False))
+                return img.set({"system:index": s.format("YYYYMMdd"), "n": c.size(),
+                                "n_prov": c.filter(ee.Filter.eq(ds["status_property"],
+                                                                ds["provisional_value"])).size()})
+
+            daily = ee.ImageCollection.fromImages(
+                ee.List.sequence(0, n - 1).map(day_image)).filter(ee.Filter.gt("n", 0))
+            info = ee.Dictionary({"names": daily.aggregate_array("system:index"),
+                                  "n": daily.aggregate_array("n"),
+                                  "n_prov": daily.aggregate_array("n_prov")}).getInfo()
+            if not info["names"]:
+                return pd.DatetimeIndex([]), {"precip": np.empty((0, grid.height, grid.width),
+                                                                 np.float32),
+                                              "_provisional": np.empty(0, bool)}
+            arr = self._pixels(daily.select(["precip"]).toBands(), grid)
+            fields = list(arr.dtype.names)
+            parsed = parse_daily_bands(fields)
+            stack = structured_to_stack(arr, fields)
+            meta = {pd.Timestamp(k): (cnt, pv) for k, cnt, pv in
+                    zip(info["names"], info["n"], info["n_prov"])}
+            dates = [d for d, _ in parsed]
+            prov = np.array([meta[d][1] > 0 or meta[d][0] < ds["slots_per_day"] for d in dates])
+            return pd.DatetimeIndex(dates), {"precip": stack, "_provisional": prov}
+
+        parts = fetch_split(fetch, start, end_excl, days, self.cfg.request_retries, log=self.log)
+        return merge_daily_parts(parts, ["precip", "_provisional"], grid)
+
 
 def merge_daily_parts(parts, vars_, grid):
     dates = [p[0] for p in parts if len(p[0])]
     if not dates:
-        return pd.DatetimeIndex([]), {v: np.empty((0, grid.height, grid.width), np.float32)
+        return pd.DatetimeIndex([]), {v: (np.empty(0, bool) if v.startswith("_") else
+                                          np.empty((0, grid.height, grid.width), np.float32))
                                       for v in vars_}
     idx = pd.DatetimeIndex(np.concatenate([d.values for d in dates]))
     data = {v: np.concatenate([p[1][v] for p in parts if len(p[0])], axis=0) for v in vars_}

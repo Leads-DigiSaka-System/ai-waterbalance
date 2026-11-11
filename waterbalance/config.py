@@ -12,6 +12,17 @@ from dataclasses import dataclass, field
 
 # ------------------------------------------------------------------ datasets (Earth Engine)
 DATASETS = {
+    # GPM IMERG V07, half-hourly, 0.1 deg, `precipitation` in mm/hr. Recent images come from the
+    # Late run (property status = 'provisional', available within about a day) and are replaced by
+    # the Final run (status = 'permanent') a few months later. Aggregated here to daily means
+    # (UTC days) on the Earth Engine side; harmonize.py converts mm/hr -> mm/day.
+    "gpm": {
+        "id": "NASA/GPM_L3/IMERG_V07",
+        "bands": {"precip": "precipitation"},
+        "status_property": "status",
+        "provisional_value": "provisional",
+        "slots_per_day": 48,
+    },
     # CHIRPS v2.0 daily, 0.05 deg, mm/day. Final product: ~3-6 weeks behind real time.
     "chirps": {
         "id": "UCSB-CHG/CHIRPS/DAILY",
@@ -29,7 +40,7 @@ DATASETS = {
             "rns": "surface_net_solar_radiation_sum",       # J m-2 day-1
             "rnl": "surface_net_thermal_radiation_sum",     # J m-2 day-1 (negative = loss)
             "psurf": "surface_pressure",                    # Pa
-            "tp": "total_precipitation_sum",                # m day-1 (fallback for missing CHIRPS days)
+            "tp": "total_precipitation_sum",                # m day-1 (fallback for missing P days)
         },
     },
     # ESA WorldCover 10 m (v200 = 2021). Class 40 = cropland.
@@ -97,7 +108,8 @@ class RunConfig:
                                               # 'semimonthly' (1st-15th, 16th-end of month)
     period_anchor: str = "2026-01-01"
     spinup_days: int = 365                    # used when no saved soil state exists for the tile
-    precip_fallback: str = "era5"             # 'era5': days CHIRPS lacks use ERA5-Land precipitation
+    precip_source: str = "gpm"                # 'gpm' (IMERG V07, ~1 day latency) or 'chirps'
+    precip_fallback: str = "era5"             # 'era5': days the P source lacks use ERA5-Land precipitation
                                               # (flagged provisional); 'none': fail instead
 
     # ---- model
@@ -121,6 +133,12 @@ class RunConfig:
     mosaic_label: str | None = None           # mosaic folder / file name (default PHILIPPINES or region)
 
     # ------------------------------------------------------------------
+    def __post_init__(self):
+        if self.precip_source not in ("gpm", "chirps"):
+            raise ValueError("precip_source must be 'gpm' or 'chirps'")
+        if self.precip_fallback not in ("era5", "none"):
+            raise ValueError("precip_fallback must be 'era5' or 'none'")
+
     def crop_params(self):
         if self.crop not in CROPS:
             raise ValueError(f"crop must be one of {sorted(CROPS)}")
@@ -142,6 +160,7 @@ class RunConfig:
         parts = dict(crop=self.crop_params(), cn=self.cn_by_hsg, tau=self.drainage_tau,
                      irr=self.irrigation, crs=self.crs, res=self.resolution_m,
                      tile=self.tile_px, cmin=self.crop_fraction_min, pf=self.precip_fallback,
+                     ps=self.precip_source,
                      ds=DATASETS)
         return hashlib.md5(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:10]
 

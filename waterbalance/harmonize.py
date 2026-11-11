@@ -9,10 +9,12 @@ One harmonized tile = an xarray Dataset on the tile's Grid:
     TAW         FC - WP, mm
     hsg, CN     hydrologic soil group (1-4 = A-D) and runoff curve number
   daily (time, y, x)
-    P           precipitation, mm/day (CHIRPS; ERA5-Land on days CHIRPS lacks)
+    P           precipitation, mm/day (GPM IMERG by default, or CHIRPS; ERA5-Land on days the
+                source lacks)
     ET0         FAO-56 reference ET from ERA5-Land, mm/day
   daily (time)
     p_fallback  1 on days whose P came from ERA5-Land (provisional), else 0
+    p_provisional  1 on days whose GPM P is not final yet (Late run / incomplete day), else 0
 
 Steps: fetch raw (native units, already on the grid) -> convert units -> fill small coastal gaps
 (nearest valid pixel) -> derive (ET0, soil limits, CN).
@@ -95,15 +97,17 @@ def harmonize_static(raw, cfg):
 
 
 # ------------------------------------------------------------------ daily layers
-def harmonize_daily(chirps, era5, start, end_excl, cfg, final=True, prev=None):
-    """chirps / era5: (DatetimeIndex, {var: (t,h,w)}) from Fetcher.daily, native units.
+def harmonize_daily(precip, era5, start, end_excl, cfg, final=True, prev=None):
+    """precip / era5: (DatetimeIndex, {var: (t,h,w)}) from Fetcher.daily, native units;
+    precip is from cfg.precip_source ('gpm': daily mean rate in mm/hr; 'chirps': mm/day).
     final : this chunk ends the window — ERA5 days missing at its end mean the data is not
             published yet (DataNotReady). In earlier chunks they are carried forward.
     prev  : ERA5 harmonized values of the day before the chunk (to carry into a leading gap).
-    -> (DatetimeIndex full daily, P mm, ET0 mm, p_fallback (t,) uint8, last-day ERA5 values)."""
+    -> (DatetimeIndex full daily, P mm, ET0 mm, flags {'p_fallback', 'p_provisional'} (t,)
+        uint8, last-day ERA5 values)."""
     full = pd.date_range(start, pd.Timestamp(end_excl) - pd.Timedelta(days=1), freq="D")
     e = _reindex_days(*era5, full)
-    c = _reindex_days(*chirps, full)
+    c = _reindex_days(*precip, full)
 
     # ---- ERA5-Land: units
     tmin = u.k_to_c(e["tmin"])
@@ -140,17 +144,24 @@ def harmonize_daily(chirps, era5, start, end_excl, cfg, final=True, prev=None):
     last = [a[-1].copy() for a in (tmin, tmax, tdew, u2, rn, pk, tp)]
     et0 = _et0.et0_from_era5(tmin, tmax, tdew, u2, rn, pk)
 
-    # ---- CHIRPS (mm/day already), ERA5 fallback on missing days
+    # ---- precipitation: GPM mean rate mm/hr -> mm/day (CHIRPS is mm/day already);
+    #      ERA5-Land on days the source has nothing
     p = np.asarray(c["precip"], dtype=np.float32)
+    if cfg.precip_source == "gpm":
+        p = u.mm_per_hr_to_mm_per_day(p)
     p = fill_nearest(p)
     missing_c = _day_missing(p)
     if missing_c.any():
         if cfg.precip_fallback != "era5":
-            raise DataNotReady(f"CHIRPS missing {int(missing_c.sum())} day(s) in "
-                               f"{full[0].date()}..{full[-1].date()}")
+            raise DataNotReady(f"{cfg.precip_source.upper()} missing {int(missing_c.sum())} day(s) "
+                               f"in {full[0].date()}..{full[-1].date()}")
         p[missing_c] = np.maximum(tp[missing_c], 0.0)
     p = np.maximum(p, 0.0)
-    return full, p.astype(np.float32), et0, missing_c.astype(np.uint8), last
+    prov = c.get("_provisional")
+    prov = np.zeros(len(full), bool) if prov is None else (np.nan_to_num(prov) > 0)
+    prov &= ~missing_c
+    flags = {"p_fallback": missing_c.astype(np.uint8), "p_provisional": prov.astype(np.uint8)}
+    return full, p.astype(np.float32), et0, flags, last
 
 
 # ------------------------------------------------------------------ tile
@@ -172,22 +183,22 @@ def harmonize_tile(fetcher, grid, start, end_excl, cfg, static=None, log=print,
     chunks = chunk_dates(start, end_excl, chunk_days)
     for k, (a, b) in enumerate(chunks):
         era5 = fetcher.daily("era5", a, b, grid)
-        chirps = fetcher.daily("chirps", a, b, grid)
-        full, p, et0, fb, prev = harmonize_daily(chirps, era5, a, b, cfg,
-                                                 final=k == len(chunks) - 1, prev=prev)
-        parts.append((full, p, et0, fb))
+        precip = fetcher.daily(cfg.precip_source, a, b, grid)
+        full, p, et0, flags, prev = harmonize_daily(precip, era5, a, b, cfg,
+                                                    final=k == len(chunks) - 1, prev=prev)
+        parts.append((full, p, et0, flags))
     full = pd.DatetimeIndex(np.concatenate([x[0].values for x in parts]))
     p = np.concatenate([x[1] for x in parts])
     et0 = np.concatenate([x[2] for x in parts])
-    fb = np.concatenate([x[3] for x in parts])
-    return to_dataset(grid, static, full, p, et0, fb)
+    flags = {k: np.concatenate([x[3][k] for x in parts]) for k in parts[0][3]}
+    return to_dataset(grid, static, full, p, et0, flags)
 
 
-def to_dataset(grid, static, full, p, et0, fb):
+def to_dataset(grid, static, full, p, et0, flags):
     coords = {"time": full, "y": grid.ys, "x": grid.xs}
     data = {k: (("y", "x"), v) for k, v in static.items()}
-    data.update({"P": (("time", "y", "x"), p), "ET0": (("time", "y", "x"), et0),
-                 "p_fallback": (("time",), fb)})
+    data.update({"P": (("time", "y", "x"), p), "ET0": (("time", "y", "x"), et0)})
+    data.update({k: (("time",), v) for k, v in flags.items()})
     ds = xr.Dataset(data, coords=coords)
     ds.attrs.update({"crs": grid.crs, "res": grid.res, "x0": grid.x0, "y1": grid.y1,
                      "units": "mm (P, ET0 per day; FC, WP, SAT, TAW over the root zone)"})
