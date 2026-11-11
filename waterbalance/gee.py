@@ -28,7 +28,11 @@ import pandas as pd
 
 from .config import DATASETS
 
-NODATA = -9999.0
+# Masked pixels are unmasked to this value and turned back into NaN after reading. It must be far
+# outside every variable's range: ERA5 net thermal radiation alone is about -4e6 J m-2 day-1, so a
+# sentinel like -9999 would wipe it out (ET0 -> NaN -> no evapotranspiration).
+NODATA = -3.0e38
+NODATA_BELOW = -1.0e38
 BYTES_PER_VALUE = 4                      # float32
 
 _SIZE_ERRORS = ("request size", "must be less than or equal", "too large", "memory limit",
@@ -115,7 +119,7 @@ def structured_to_stack(arr, names):
     """computePixels NUMPY_NDARRAY (structured, one field per band) -> float32 (n, h, w),
     NODATA -> NaN."""
     out = np.stack([np.asarray(arr[n], dtype=np.float32) for n in names])
-    out[out <= NODATA + 1] = np.nan
+    out[out <= NODATA_BELOW] = np.nan
     return out
 
 

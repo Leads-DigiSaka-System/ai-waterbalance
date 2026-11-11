@@ -31,8 +31,17 @@ from . import units as u
 from .config import DATASETS
 
 
+# Bump when a harmonization fix changes the cached tiles (invalidates the cache and the soil state).
+#   2: nodata sentinel no longer wipes out negative ERA5 values (net thermal radiation)
+HARMONIZE_VERSION = 2
+
+
 class DataNotReady(RuntimeError):
     """A dataset does not reach the end of the requested window yet (latency)."""
+
+
+class BadData(RuntimeError):
+    """A variable came back without usable values (wrong band, units or masking)."""
 
 
 # ------------------------------------------------------------------ helpers
@@ -141,8 +150,16 @@ def harmonize_daily(precip, era5, start, end_excl, cfg, final=True, prev=None):
                     a[k] = a[first_ok]
 
     tmin, tmax, tdew, u2, rn, pk, tp = (fill_nearest(a) for a in arrays)
+    names = ("tmin", "tmax", "tdew", "u10/v10", "rns+rnl", "psurf", "tp")
+    for name, a in zip(names, (tmin, tmax, tdew, u2, rn, pk, tp)):
+        bad = ~np.isfinite(a).all(axis=(1, 2))
+        if bad.any():
+            raise BadData(f"ERA5-Land {name}: no valid values on {int(bad.sum())} day(s) "
+                          f"from {full[bad][0].date()} — check the band, its units and masking")
     last = [a[-1].copy() for a in (tmin, tmax, tdew, u2, rn, pk, tp)]
     et0 = _et0.et0_from_era5(tmin, tmax, tdew, u2, rn, pk)
+    if not np.isfinite(et0).all():
+        raise BadData("ET0 has NaN values")
 
     # ---- precipitation: GPM mean rate mm/hr -> mm/day (CHIRPS is mm/day already);
     #      ERA5-Land on days the source has nothing

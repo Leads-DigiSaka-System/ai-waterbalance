@@ -98,3 +98,12 @@ def test_band_parsing_and_nodata():
     arr["b"][0, 0] = gee.NODATA
     st = gee.structured_to_stack(arr, ["a", "b"])
     assert st.shape == (2, 2, 2) and np.isnan(st[1, 0, 0]) and st[0].sum() == 4
+
+
+def test_negative_physical_values_are_not_nodata():
+    # ERA5 net thermal radiation is ~ -4e6 J m-2 day-1; it must survive the nodata conversion
+    arr = np.zeros((2, 2), dtype=[("rns", "f4"), ("rnl", "f4"), ("masked", "f4")])
+    arr["rns"], arr["rnl"], arr["masked"] = 17e6, -4e6, gee.NODATA
+    st = gee.structured_to_stack(arr, ["rns", "rnl", "masked"])
+    assert st[1, 0, 0] == pytest.approx(-4e6)
+    assert np.isnan(st[2]).all()
